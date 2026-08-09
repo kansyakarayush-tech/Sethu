@@ -1,416 +1,1829 @@
-// ---------- storage layer (swap for real API calls when backend is ready) ----------
-const STORE_KEYS = { requests:'sethu_requests', shelters:'sethu_shelters', missing:'sethu_missing' };
-const channel = 'BroadcastChannel' in window ? new BroadcastChannel('sethu_sync') : null;
+/* Sethu - Disaster Response Coordination Platform */
 
-function load(key){ return JSON.parse(localStorage.getItem(key) || '[]'); }
-function save(key, data){
-  localStorage.setItem(key, JSON.stringify(data));
-  if(channel) channel.postMessage({ key }); // tell other open tabs to refresh
-}
-function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
+const STORAGE_KEY = "sethu_state_v2";
 
-// ---------- seed demo data (only on first run, so judges see a live scenario) ----------
-function seed(){
-  if(localStorage.getItem('sethu_seeded')) return;
-  const requests = [
-    { id:uid(), type:'rescue', severity:'critical', area:'Diara Village, Patna', description:'Family of 5 stranded on rooftop, water rising', phone:'', lat:25.62, lng:85.08, status:'open', claimedBy:null, createdAt:Date.now()-1000*60*40 },
-    { id:uid(), type:'medical', severity:'high', area:'Maner Block', description:'Elderly woman needs insulin', phone:'', lat:25.53, lng:84.88, status:'claimed', claimedBy:'Volunteer: Ravi K.', createdAt:Date.now()-1000*60*90 },
-    { id:uid(), type:'food', severity:'medium', area:'Fatuha', description:'40 people without food since morning', phone:'', lat:25.51, lng:85.31, status:'open', claimedBy:null, createdAt:Date.now()-1000*60*20 },
-    { id:uid(), type:'water', severity:'high', area:'Bakhtiyarpur', description:'No clean drinking water, children falling sick', phone:'', lat:25.43, lng:85.53, status:'open', claimedBy:null, createdAt:Date.now()-1000*60*55 },
-    { id:uid(), type:'shelter', severity:'medium', area:'Danapur', description:'Home flooded, need temporary shelter for 3', phone:'', lat:25.63, lng:85.05, status:'resolved', claimedBy:'NGO: Rahat Seva', createdAt:Date.now()-1000*60*200 }
-  ];
-  const shelters = [
-    { id:uid(), name:'Government Middle School, Fatuha', area:'Fatuha', lat:25.505, lng:85.315, capacity:150, occupied:98, contact:'0612-XXXXXXX' },
-    { id:uid(), name:'Community Hall, Danapur', area:'Danapur', lat:25.635, lng:85.045, capacity:80, occupied:80, contact:'0612-XXXXXXX' },
-    { id:uid(), name:'Panchayat Bhawan, Maner', area:'Maner', lat:25.525, lng:84.885, capacity:60, occupied:22, contact:'0612-XXXXXXX' }
-  ];
-  const missing = [
-    { id:uid(), name:'Suresh Manjhi', age:52, lastSeen:'Near Ganga bridge, Diara village', photo:'', contact:'9800000000', status:'missing', postedAt:Date.now()-1000*60*300 }
-  ];
-  save(STORE_KEYS.requests, requests);
-  save(STORE_KEYS.shelters, shelters);
-  save(STORE_KEYS.missing, missing);
-  localStorage.setItem('sethu_seeded','1');
-}
-seed();
-
-// ---------- view switching ----------
-const tabBtns = document.querySelectorAll('.tab-btn');
-tabBtns.forEach(btn => btn.addEventListener('click', () => switchView(btn.dataset.view)));
-function switchView(view){
-  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById('view-' + view).classList.add('active');
-  tabBtns.forEach(b => b.classList.toggle('active', b.dataset.view === view));
-  if(view === 'map') setTimeout(() => map.invalidateSize(), 50); // fix leaflet sizing after display:none
-}
-
-// ---------- toast helper ----------
-let toastTimer;
-function toast(msg){
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
-}
-
-// ---------- connectivity status ----------
-function updateStatus(){
-  const strip = document.getElementById('statusStrip');
-  const text = document.getElementById('statusText');
-  if(navigator.onLine){
-    strip.classList.remove('offline');
-    text.textContent = 'Online — synced across devices';
-  } else {
-    strip.classList.add('offline');
-    text.textContent = 'Offline — saving locally, will sync when back online';
-  }
-}
-window.addEventListener('online', updateStatus);
-window.addEventListener('offline', updateStatus);
-updateStatus();
-
-// ================= LIVE MAP =================
-const map = L.map('map', { scrollWheelZoom:true }).setView([25.59, 85.14], 8);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '&copy; OpenStreetMap contributors', maxZoom: 18
-}).addTo(map);
-
-let markers = [];
-function pinIcon(status, severity){
-  const cls = status === 'resolved' ? 'pin pin-resolved' : `pin pin-${severity}`;
-  const pulse = (status !== 'resolved' && (severity === 'critical' || severity === 'high')) ? ' pin-pulse' : '';
-  return L.divIcon({ className:'', html:`<span class="${cls}${pulse}"></span>`, iconSize:[16,16] });
-}
-
-function renderMap(){
-  markers.forEach(m => map.removeLayer(m));
-  markers = [];
-  const filter = document.getElementById('filterSeverity').value;
-  const requests = load(STORE_KEYS.requests);
-  requests
-    .filter(r => filter === 'all' || r.severity === filter)
-    .forEach(r => {
-      const marker = L.marker([r.lat, r.lng], { icon: pinIcon(r.status, r.severity) }).addTo(map);
-      marker.bindPopup(`<strong>${capitalize(r.type)} — ${capitalize(r.severity)}</strong><br>${r.area}<br>${r.description || ''}<br><em>${capitalize(r.status)}</em>`);
-      markers.push(marker);
-    });
-}
-function capitalize(s){ return s.charAt(0).toUpperCase() + s.slice(1); }
-
-// ---------- request list + claim/resolve workflow ----------
-function renderRequests(){
-  const list = document.getElementById('requestItems');
-  const filter = document.getElementById('filterSeverity').value;
-  const requests = load(STORE_KEYS.requests)
-    .filter(r => filter === 'all' || r.severity === filter)
-    .sort((a,b) => severityRank(b.severity) - severityRank(a.severity) || b.createdAt - a.createdAt);
-
-  list.innerHTML = requests.map(r => `
-    <li class="request-card" data-id="${r.id}">
-      <div class="rc-top">
-        <h4>${capitalize(r.type)} — ${escapeHtml(r.area)}</h4>
-        <span class="badge badge-${r.severity}">${r.severity}</span>
-      </div>
-      <p>${escapeHtml(r.description || 'No further details provided.')}</p>
-      <div class="rc-meta">
-        <span class="badge badge-${r.status}">${r.status}</span>
-        &nbsp;${timeAgo(r.createdAt)}${r.claimedBy ? ' · ' + escapeHtml(r.claimedBy) : ''}
-      </div>
-      <div class="rc-actions">
-        <button class="btn-claim" data-action="claim" ${r.status !== 'open' ? 'disabled' : ''}>I'll handle this</button>
-        <button class="btn-resolve" data-action="resolve" ${r.status !== 'claimed' ? 'disabled' : ''}>Mark resolved</button>
-      </div>
-    </li>
-  `).join('') || '<p style="color:#8a8f97;font-size:.85rem;">No requests match this filter.</p>';
-}
-function severityRank(s){ return { critical:3, high:2, medium:1 }[s] || 0; }
-function timeAgo(ts){
-  const min = Math.round((Date.now() - ts) / 60000);
-  if(min < 60) return min + 'm ago';
-  return Math.round(min/60) + 'h ago';
-}
-function escapeHtml(s){ const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-
-document.getElementById('requestItems').addEventListener('click', e => {
-  const btn = e.target.closest('button[data-action]');
-  if(!btn) return;
-  const id = btn.closest('.request-card').dataset.id;
-  const requests = load(STORE_KEYS.requests);
-  const req = requests.find(r => r.id === id);
-  if(!req) return;
-  if(btn.dataset.action === 'claim'){
-    req.status = 'claimed';
-    req.claimedBy = 'Volunteer: You'; // real backend would use the logged-in volunteer's name
-    toast('Request claimed — the requester status is now updated for everyone.');
-  } else {
-    req.status = 'resolved';
-    toast('Marked resolved. Great work.');
-  }
-  save(STORE_KEYS.requests, requests);
-  refreshAll();
-});
-document.getElementById('filterSeverity').addEventListener('change', () => { renderMap(); renderRequests(); });
-
-// ================= REPORT NEED FORM =================
-let capturedLocation = null;
-function locateUser(){
-  const status = document.getElementById('locationStatus');
-  if(!navigator.geolocation){ status.textContent = 'Location unavailable — request will use area name only.'; return; }
-  navigator.geolocation.getCurrentPosition(
-    pos => {
-      capturedLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-      status.textContent = `Location captured: ${capturedLocation.lat.toFixed(4)}, ${capturedLocation.lng.toFixed(4)}`;
+const defaultState = {
+  requests: [
+    {
+      id: "REQ-1042",
+      type: "Rescue",
+      severity: "critical",
+      title: "Family stranded on rooftop",
+      description: "6 people need boat rescue. Water level rising rapidly.",
+      location: "Mithapur, Bihar",
+      lat: 25.462,
+      lng: 85.704,
+      status: "open",
+      createdAt: Date.now() - 1000 * 60 * 12,
+      claimedBy: null
     },
-    () => { status.textContent = 'Could not access location — request will use area name only.'; },
-    { timeout: 8000 }
-  );
-}
-locateUser();
+    {
+      id: "REQ-1041",
+      type: "Medical",
+      severity: "high",
+      title: "Urgent medicine required",
+      description: "Insulin and basic medicines required for elderly residents.",
+      location: "Patna Rural",
+      lat: 25.594,
+      lng: 85.137,
+      status: "claimed",
+      createdAt: Date.now() - 1000 * 60 * 32,
+      claimedBy: "Volunteer Team A"
+    },
+    {
+      id: "REQ-1040",
+      type: "Food",
+      severity: "medium",
+      title: "Food packets required",
+      description: "Around 35 people need food and drinking water.",
+      location: "Hajipur",
+      lat: 25.686,
+      lng: 85.214,
+      status: "open",
+      createdAt: Date.now() - 1000 * 60 * 52,
+      claimedBy: null
+    }
+  ],
 
-document.getElementById('reportForm').addEventListener('submit', e => {
-  e.preventDefault();
-  const requests = load(STORE_KEYS.requests);
-  const fallback = { lat: 25.59 + (Math.random()-0.5)*0.4, lng: 85.14 + (Math.random()-0.5)*0.4 };
-  requests.push({
-    id: uid(),
-    type: document.getElementById('needType').value,
-    severity: document.getElementById('severity').value,
-    area: document.getElementById('area').value,
-    description: document.getElementById('description').value,
-    phone: document.getElementById('phone').value,
-    lat: (capturedLocation || fallback).lat,
-    lng: (capturedLocation || fallback).lng,
-    status: 'open', claimedBy: null, createdAt: Date.now()
-  });
-  save(STORE_KEYS.requests, requests);
-  e.target.reset();
-  toast('Request submitted. Volunteers can now see it on the live map.');
-  switchView('map'); document.querySelector('[data-view="map"]').classList.add('active');
-  refreshAll();
+  shelters: [
+    {
+      id: 1,
+      name: "Mithapur Community Shelter",
+      address: "Mithapur, Bihar",
+      lat: 25.462,
+      lng: 85.704,
+      capacity: 50,
+      occupied: 40,
+      contact: "Emergency Desk",
+      status: "open"
+    },
+    {
+      id: 2,
+      name: "Patna Relief Centre",
+      address: "Patna, Bihar",
+      lat: 25.594,
+      lng: 85.137,
+      capacity: 100,
+      occupied: 62,
+      contact: "Relief Control Room",
+      status: "open"
+    },
+    {
+      id: 3,
+      name: "Hajipur School Shelter",
+      address: "Hajipur, Bihar",
+      lat: 25.686,
+      lng: 85.214,
+      capacity: 75,
+      occupied: 74,
+      contact: "Shelter Coordinator",
+      status: "limited"
+    }
+  ],
+
+  missingPersons: [
+    {
+      id: "MP-201",
+      name: "Rahul Kumar",
+      age: 17,
+      gender: "Male",
+      location: "Mithapur",
+      description: "Last seen near the main bridge.",
+      image: "",
+      status: "missing",
+      createdAt: Date.now() - 1000 * 60 * 60 * 3
+    },
+    {
+      id: "MP-202",
+      name: "Sunita Devi",
+      age: 42,
+      gender: "Female",
+      location: "Hajipur",
+      description: "Wearing a blue saree. Last seen near relief camp.",
+      image: "",
+      status: "missing",
+      createdAt: Date.now() - 1000 * 60 * 60 * 5
+    }
+  ],
+
+  sosAlerts: [],
+  role: "affected"
+};
+
+let state = loadState();
+let map;
+let markersLayer;
+let userMarker = null;
+let selectedRequestId = null;
+
+document.addEventListener("DOMContentLoaded", () => {
+  initializeApp();
 });
 
-// ================= SHELTERS =================
-function renderShelters(){
-  const grid = document.getElementById('shelterGrid');
-  const shelters = load(STORE_KEYS.shelters);
-  grid.innerHTML = shelters.map(s => {
-    const pct = Math.min(100, Math.round((s.occupied / s.capacity) * 100));
-    return `
-    <article class="info-card">
-      <h3>${escapeHtml(s.name)}</h3>
-      <p>${escapeHtml(s.area)}</p>
-      <div class="capacity-bar"><div class="capacity-fill ${pct >= 100 ? 'full' : ''}" style="width:${pct}%"></div></div>
-      <p><strong>${s.occupied}/${s.capacity}</strong> beds occupied${pct >= 100 ? ' — FULL' : ''}</p>
-      <p>Contact: ${escapeHtml(s.contact || 'n/a')}</p>
-    </article>`;
-  }).join('') || '<p style="color:#8a8f97;">No shelters added yet.</p>';
+function initializeApp() {
+  setupNavigation();
+  setupRoleSwitcher();
+  setupForms();
+  setupFilters();
+  setupModals();
+  setupSOS();
+  setupLocationButtons();
+  setupMobileMenu();
+
+  initializeMap();
+  renderEverything();
+
+  window.addEventListener("online", updateConnectionStatus);
+  window.addEventListener("offline", updateConnectionStatus);
+
+  updateConnectionStatus();
 }
 
-document.getElementById('addShelterBtn').addEventListener('click', () => {
-  openModal(`
-    <h3>Add a shelter</h3>
-    <form id="shelterForm">
-      <label for="sName">Shelter name</label>
-      <input id="sName" required>
-      <label for="sArea">Area</label>
-      <input id="sArea" required>
-      <label for="sCap">Total capacity</label>
-      <input id="sCap" type="number" min="1" required>
-      <label for="sOcc">Currently occupied</label>
-      <input id="sOcc" type="number" min="0" value="0" required>
-      <label for="sContact">Contact number</label>
-      <input id="sContact">
-      <button class="btn-primary" type="submit">Save shelter</button>
-    </form>
-  `);
-  document.getElementById('shelterForm').addEventListener('submit', e => {
-    e.preventDefault();
-    const shelters = load(STORE_KEYS.shelters);
-    shelters.push({
-      id: uid(),
-      name: document.getElementById('sName').value,
-      area: document.getElementById('sArea').value,
-      capacity: Number(document.getElementById('sCap').value),
-      occupied: Number(document.getElementById('sOcc').value),
-      contact: document.getElementById('sContact').value,
-      lat: 25.59 + (Math.random()-0.5)*0.4, lng: 85.14 + (Math.random()-0.5)*0.4
-    });
-    save(STORE_KEYS.shelters, shelters);
-    closeModal();
-    toast('Shelter added.');
-    refreshAll();
-  });
-});
+/* ---------------- STATE ---------------- */
 
-// ================= MISSING PERSONS =================
-function renderMissing(query=''){
-  const grid = document.getElementById('missingGrid');
-  const q = query.toLowerCase();
-  const missing = load(STORE_KEYS.missing).filter(m =>
-    m.name.toLowerCase().includes(q) || m.lastSeen.toLowerCase().includes(q)
-  );
-  grid.innerHTML = missing.map(m => `
-    <article class="info-card">
-      <img class="missing-photo" src="${m.photo || placeholderPhoto()}" alt="Photo of ${escapeHtml(m.name)}">
-      <span class="status-pill status-${m.status}">${m.status}</span>
-      <h3>${escapeHtml(m.name)}${m.age ? ', ' + m.age : ''}</h3>
-      <p>Last seen: ${escapeHtml(m.lastSeen)}</p>
-      <p>Contact: ${escapeHtml(m.contact || 'n/a')}</p>
-      ${m.status === 'missing' ? `<button class="btn-secondary" data-found="${m.id}">Mark as found</button>` : ''}
-    </article>
-  `).join('') || '<p style="color:#8a8f97;">No matching reports.</p>';
-}
-function placeholderPhoto(){
-  return 'data:image/svg+xml;utf8,' + encodeURIComponent(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="240" height="150"><rect width="100%" height="100%" fill="#e7e1cf"/><text x="50%" y="50%" text-anchor="middle" fill="#8a8f97" font-family="sans-serif" font-size="13">No photo</text></svg>`
-  );
-}
-document.getElementById('missingSearch').addEventListener('input', e => renderMissing(e.target.value));
-document.getElementById('missingGrid').addEventListener('click', e => {
-  const id = e.target.dataset.found;
-  if(!id) return;
-  const missing = load(STORE_KEYS.missing);
-  const person = missing.find(m => m.id === id);
-  person.status = 'found';
-  save(STORE_KEYS.missing, missing);
-  toast(`${person.name} marked as found.`);
-  renderMissing(document.getElementById('missingSearch').value);
-});
+function loadState() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
 
-document.getElementById('addMissingBtn').addEventListener('click', () => {
-  openModal(`
-    <h3>Post a missing person report</h3>
-    <form id="missingForm">
-      <label for="mName">Full name</label>
-      <input id="mName" required>
-      <label for="mAge">Age</label>
-      <input id="mAge" type="number" min="0">
-      <label for="mLast">Last seen location</label>
-      <input id="mLast" required>
-      <label for="mContact">Your contact number</label>
-      <input id="mContact" required>
-      <label for="mPhoto">Photo (optional)</label>
-      <input id="mPhoto" type="file" accept="image/*">
-      <button class="btn-primary" type="submit">Post report</button>
-    </form>
-  `);
-  document.getElementById('missingForm').addEventListener('submit', e => {
-    e.preventDefault();
-    const fileInput = document.getElementById('mPhoto');
-    const finish = (photoData) => {
-      const missing = load(STORE_KEYS.missing);
-      missing.push({
-        id: uid(),
-        name: document.getElementById('mName').value,
-        age: document.getElementById('mAge').value,
-        lastSeen: document.getElementById('mLast').value,
-        contact: document.getElementById('mContact').value,
-        photo: photoData || '',
-        status: 'missing', postedAt: Date.now()
-      });
-      save(STORE_KEYS.missing, missing);
-      closeModal();
-      toast('Missing person report posted.');
-      refreshAll();
+    if (!saved) {
+      return structuredClone(defaultState);
+    }
+
+    const parsed = JSON.parse(saved);
+
+    return {
+      ...structuredClone(defaultState),
+      ...parsed
     };
-    if(fileInput.files[0]){
-      const reader = new FileReader();
-      reader.onload = () => finish(reader.result);
-      reader.readAsDataURL(fileInput.files[0]);
-    } else finish('');
-  });
-});
-
-// ================= MODAL HELPERS =================
-function openModal(html){
-  document.getElementById('modalBody').innerHTML = html;
-  const overlay = document.getElementById('modalOverlay');
-  overlay.hidden = false;
-  overlay.style.display = 'grid';
-}
-function closeModal(){
-  const overlay = document.getElementById('modalOverlay');
-  overlay.hidden = true;
-  overlay.style.display = 'none';
-}
-document.getElementById('modalClose').addEventListener('click', closeModal);
-document.getElementById('modalOverlay').addEventListener('click', e => { if(e.target.id === 'modalOverlay') closeModal(); });
-
-// ================= DASHBOARD =================
-function renderDashboard(){
-  const requests = load(STORE_KEYS.requests);
-  const open = requests.filter(r => r.status === 'open').length;
-  const claimed = requests.filter(r => r.status === 'claimed').length;
-  const resolved = requests.filter(r => r.status === 'resolved').length;
-
-  document.getElementById('statRow').innerHTML = [
-    ['Total requests', requests.length],
-    ['Open', open],
-    ['Claimed', claimed],
-    ['Resolved', resolved],
-    ['Shelters', load(STORE_KEYS.shelters).length],
-    ['Missing persons', load(STORE_KEYS.missing).filter(m => m.status === 'missing').length]
-  ].map(([label,num]) => `<div class="stat-card"><div class="num">${num}</div><div class="label">${label}</div></div>`).join('');
-
-  // unresolved by area
-  const byArea = {};
-  requests.filter(r => r.status !== 'resolved').forEach(r => { byArea[r.area] = (byArea[r.area]||0) + 1; });
-  renderBars('areaBars', byArea);
-
-  // by severity
-  const bySeverity = { critical:0, high:0, medium:0 };
-  requests.forEach(r => { bySeverity[r.severity] = (bySeverity[r.severity]||0) + 1; });
-  renderBars('severityBars', bySeverity);
-}
-function renderBars(elId, data){
-  const entries = Object.entries(data).sort((a,b) => b[1]-a[1]);
-  const max = Math.max(1, ...entries.map(e => e[1]));
-  document.getElementById(elId).innerHTML = entries.map(([label,count]) => `
-    <li class="bar-row">
-      <span class="bar-label">${escapeHtml(label)}</span>
-      <span class="bar-track"><span class="bar-fill" style="width:${(count/max)*100}%"></span></span>
-      <span class="bar-count">${count}</span>
-    </li>
-  `).join('') || '<p style="color:#8a8f97;font-size:.8rem;">No data yet.</p>';
-}
-
-// ================= SOS BUTTON =================
-document.getElementById('sosBtn').addEventListener('click', () => {
-  const finish = (lat, lng) => {
-    const requests = load(STORE_KEYS.requests);
-    requests.push({
-      id: uid(), type:'rescue', severity:'critical', area:'SOS — auto location',
-      description:'Emergency SOS triggered — immediate assistance needed.',
-      phone:'', lat, lng, status:'open', claimedBy:null, createdAt:Date.now()
-    });
-    save(STORE_KEYS.requests, requests);
-    toast('SOS sent with your location. Help is being alerted.');
-    switchView('map');
-    refreshAll();
-    map.setView([lat,lng], 13);
-  };
-  if(navigator.geolocation){
-    navigator.geolocation.getCurrentPosition(
-      pos => finish(pos.coords.latitude, pos.coords.longitude),
-      () => finish(25.59 + (Math.random()-0.5)*0.4, 85.14 + (Math.random()-0.5)*0.4),
-      { timeout: 6000 }
-    );
-  } else {
-    finish(25.59, 85.14);
+  } catch (error) {
+    console.error("State loading failed:", error);
+    return structuredClone(defaultState);
   }
-});
+}
 
-// ================= SYNC ACROSS TABS / DEVICES ON THIS BROWSER =================
-if(channel) channel.onmessage = refreshAll;
-window.addEventListener('storage', refreshAll); // fallback for browsers without BroadcastChannel
-setInterval(refreshAll, 5000); // poll, so this becomes a drop-in place for real backend polling later
+function saveState() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 
-function refreshAll(){
-  renderMap();
+  if ("BroadcastChannel" in window) {
+    try {
+      const channel = new BroadcastChannel("sethu_sync");
+      channel.postMessage(state);
+      channel.close();
+    } catch (error) {
+      console.warn("Broadcast sync unavailable.");
+    }
+  }
+}
+
+/* ---------------- NAVIGATION ---------------- */
+
+function setupNavigation() {
+  document.querySelectorAll("[data-section]").forEach(button => {
+    button.addEventListener("click", () => {
+      const sectionId = button.dataset.section;
+
+      showSection(sectionId);
+
+      document.querySelectorAll("[data-section]").forEach(item => {
+        item.classList.remove("active");
+      });
+
+      button.classList.add("active");
+    });
+  });
+}
+
+function showSection(sectionId) {
+  document.querySelectorAll("main section, .page-section").forEach(section => {
+    section.classList.remove("active");
+  });
+
+  const target = document.getElementById(sectionId);
+
+  if (target) {
+    target.classList.add("active");
+    target.scrollIntoView({
+      behavior: "smooth",
+      block: "start"
+    });
+  }
+
+  closeMobileMenu();
+}
+
+/* ---------------- ROLE ---------------- */
+
+function setupRoleSwitcher() {
+  document.querySelectorAll("[data-role]").forEach(button => {
+    button.addEventListener("click", () => {
+      state.role = button.dataset.role;
+
+      document.querySelectorAll("[data-role]").forEach(item => {
+        item.classList.toggle(
+          "active",
+          item.dataset.role === state.role
+        );
+      });
+
+      saveState();
+      updateRoleUI();
+
+      showToast(
+        `${capitalize(state.role)} mode activated`,
+        "success"
+      );
+    });
+  });
+
+  updateRoleUI();
+}
+
+function updateRoleUI() {
+  document.body.dataset.role = state.role;
+
+  const roleLabels = document.querySelectorAll("[data-current-role]");
+
+  roleLabels.forEach(label => {
+    label.textContent = capitalize(state.role);
+  });
+}
+
+/* ---------------- MAP ---------------- */
+
+function initializeMap() {
+  const mapElement = document.getElementById("map");
+
+  if (!mapElement || typeof L === "undefined") {
+    return;
+  }
+
+  map = L.map(mapElement).setView([25.594, 85.137], 8);
+
+  L.tileLayer(
+    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }
+  ).addTo(map);
+
+  markersLayer = L.layerGroup().addTo(map);
+
+  renderMapMarkers();
+}
+
+function renderMapMarkers() {
+  if (!map || !markersLayer) return;
+
+  markersLayer.clearLayers();
+
+  state.requests.forEach(request => {
+    if (!request.lat || !request.lng) return;
+
+    const marker = L.marker([
+      request.lat,
+      request.lng
+    ]).addTo(markersLayer);
+
+    marker.bindPopup(`
+      <div class="map-popup">
+        <strong>${escapeHTML(request.title)}</strong>
+        <p>${escapeHTML(request.location)}</p>
+        <span class="status-badge ${request.severity}">
+          ${capitalize(request.severity)}
+        </span>
+        <p>${escapeHTML(request.type)} request</p>
+        <button
+          class="popup-action"
+          onclick="openRequest('${request.id}')"
+        >
+          View Request
+        </button>
+      </div>
+    `);
+  });
+
+  state.shelters.forEach(shelter => {
+    const marker = L.marker(
+      [shelter.lat, shelter.lng],
+      {
+        icon: createShelterIcon()
+      }
+    ).addTo(markersLayer);
+
+    marker.bindPopup(`
+      <div class="map-popup">
+        <strong>${escapeHTML(shelter.name)}</strong>
+        <p>${escapeHTML(shelter.address)}</p>
+        <p>
+          ${shelter.occupied}/${shelter.capacity} occupied
+        </p>
+        <button
+          class="popup-action"
+          onclick="focusShelter(${shelter.id})"
+        >
+          View Shelter
+        </button>
+      </div>
+    `);
+  });
+}
+
+function createShelterIcon() {
+  if (typeof L === "undefined") return undefined;
+
+  return L.divIcon({
+    className: "shelter-map-icon",
+    html: "🏠",
+    iconSize: [30, 30],
+    iconAnchor: [15, 15]
+  });
+}
+
+function focusMap(lat, lng, zoom = 14) {
+  if (!map) return;
+
+  map.setView([lat, lng], zoom);
+}
+
+function focusShelter(id) {
+  const shelter = state.shelters.find(item => item.id === id);
+
+  if (!shelter) return;
+
+  showSection("shelters");
+  focusMap(shelter.lat, shelter.lng);
+}
+
+/* ---------------- LOCATION ---------------- */
+
+function setupLocationButtons() {
+  document.querySelectorAll("[data-location]").forEach(button => {
+    button.addEventListener("click", getUserLocation);
+  });
+}
+
+function getUserLocation() {
+  if (!navigator.geolocation) {
+    showToast(
+      "Geolocation is not supported by this browser.",
+      "error"
+    );
+    return;
+  }
+
+  showToast("Getting your location...", "info");
+
+  navigator.geolocation.getCurrentPosition(
+    position => {
+      const { latitude, longitude } = position.coords;
+
+      if (map) {
+        map.setView(
+          [latitude, longitude],
+          14
+        );
+
+        if (userMarker) {
+          userMarker.remove();
+        }
+
+        userMarker = L.marker([
+          latitude,
+          longitude
+        ])
+          .addTo(map)
+          .bindPopup("You are here")
+          .openPopup();
+      }
+
+      const latInput = document.querySelector("#latitude");
+      const lngInput = document.querySelector("#longitude");
+
+      if (latInput) latInput.value = latitude;
+      if (lngInput) lngInput.value = longitude;
+
+      showToast(
+        "Location detected successfully.",
+        "success"
+      );
+    },
+    error => {
+      console.error(error);
+
+      showToast(
+        "Unable to get your location. Please enter it manually.",
+        "error"
+      );
+    },
+    {
+      enableHighAccuracy: true,
+      timeout: 10000,
+      maximumAge: 30000
+    }
+  );
+}
+
+/* ---------------- REQUESTS ---------------- */
+
+function setupForms() {
+  const requestForm = document.getElementById("requestForm");
+
+  if (requestForm) {
+    requestForm.addEventListener("submit", handleRequestSubmit);
+  }
+
+  const missingForm = document.getElementById("missingPersonForm");
+
+  if (missingForm) {
+    missingForm.addEventListener(
+      "submit",
+      handleMissingPersonSubmit
+    );
+  }
+}
+
+function handleRequestSubmit(event) {
+  event.preventDefault();
+
+  const form = event.currentTarget;
+  const data = new FormData(form);
+
+  const request = {
+    id: generateId("REQ"),
+    type: data.get("type") || "Other",
+    severity: data.get("severity") || "medium",
+    title: data.get("title") || "Emergency request",
+    description: data.get("description") || "",
+    location: data.get("location") || "Unknown location",
+    lat: Number(data.get("latitude")) || 25.594,
+    lng: Number(data.get("longitude")) || 85.137,
+    status: "open",
+    createdAt: Date.now(),
+    claimedBy: null
+  };
+
+  state.requests.unshift(request);
+
+  saveState();
+  renderEverything();
+
+  form.reset();
+
+  closeModal("requestModal");
+
+  showToast(
+    "Emergency request submitted successfully.",
+    "success"
+  );
+
+  showSection("requests");
+}
+
+function claimRequest(id) {
+  const request = state.requests.find(
+    item => item.id === id
+  );
+
+  if (!request) return;
+
+  if (request.status !== "open") {
+    showToast(
+      "This request is no longer available.",
+      "error"
+    );
+    return;
+  }
+
+  request.status = "claimed";
+  request.claimedBy = "Current Volunteer";
+
+  saveState();
+  renderEverything();
+
+  showToast(
+    "Request claimed successfully.",
+    "success"
+  );
+}
+
+function resolveRequest(id) {
+  const request = state.requests.find(
+    item => item.id === id
+  );
+
+  if (!request) return;
+
+  request.status = "resolved";
+  request.resolvedAt = Date.now();
+
+  saveState();
+  renderEverything();
+
+  showToast(
+    "Request marked as resolved.",
+    "success"
+  );
+}
+
+function openRequest(id) {
+  const request = state.requests.find(
+    item => item.id === id
+  );
+
+  if (!request) return;
+
+  selectedRequestId = id;
+
+  const modal = document.getElementById("requestDetailsModal");
+
+  if (!modal) {
+    focusMap(request.lat, request.lng);
+    return;
+  }
+
+  const content = modal.querySelector(
+    "[data-request-details]"
+  );
+
+  if (content) {
+    content.innerHTML = `
+      <div class="request-detail">
+        <span class="status-badge ${request.severity}">
+          ${capitalize(request.severity)}
+        </span>
+
+        <h2>${escapeHTML(request.title)}</h2>
+
+        <p>${escapeHTML(request.description)}</p>
+
+        <div class="detail-row">
+          <strong>Type</strong>
+          <span>${escapeHTML(request.type)}</span>
+        </div>
+
+        <div class="detail-row">
+          <strong>Location</strong>
+          <span>${escapeHTML(request.location)}</span>
+        </div>
+
+        <div class="detail-row">
+          <strong>Status</strong>
+          <span>${capitalize(request.status)}</span>
+        </div>
+
+        ${
+          request.claimedBy
+            ? `
+              <div class="detail-row">
+                <strong>Handled by</strong>
+                <span>${escapeHTML(request.claimedBy)}</span>
+              </div>
+            `
+            : ""
+        }
+
+        <div class="modal-actions">
+          ${
+            request.status === "open"
+              ? `
+                <button
+                  class="btn btn-primary"
+                  onclick="claimRequest('${request.id}')"
+                >
+                  Claim Request
+                </button>
+              `
+              : ""
+          }
+
+          ${
+            request.status === "claimed"
+              ? `
+                <button
+                  class="btn btn-success"
+                  onclick="resolveRequest('${request.id}')"
+                >
+                  Mark Resolved
+                </button>
+              `
+              : ""
+          }
+
+          <button
+            class="btn btn-secondary"
+            onclick="focusMap(${request.lat}, ${request.lng}); closeModal('requestDetailsModal')"
+          >
+            View on Map
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  openModal("requestDetailsModal");
+}
+
+/* ---------------- FILTERS ---------------- */
+
+function setupFilters() {
+  document.addEventListener("input", event => {
+    if (
+      event.target.matches(
+        "[data-filter-search], #requestSearch, #shelterSearch, #missingSearch"
+      )
+    ) {
+      renderEverything();
+    }
+  });
+
+  document.addEventListener("change", event => {
+    if (
+      event.target.matches(
+        "[data-filter], #requestStatusFilter, #severityFilter, #shelterFilter, #missingStatusFilter"
+      )
+    ) {
+      renderEverything();
+    }
+  });
+}
+
+function getFilteredRequests() {
+  const search =
+    getValue([
+      "#requestSearch",
+      "[data-filter-search]"
+    ]).toLowerCase();
+
+  const severity =
+    getValue([
+      "#severityFilter"
+    ]).toLowerCase();
+
+  const status =
+    getValue([
+      "#requestStatusFilter"
+    ]).toLowerCase();
+
+  return state.requests.filter(request => {
+    const matchesSearch =
+      !search ||
+      request.title.toLowerCase().includes(search) ||
+      request.location.toLowerCase().includes(search) ||
+      request.type.toLowerCase().includes(search);
+
+    const matchesSeverity =
+      !severity ||
+      severity === "all" ||
+      request.severity === severity;
+
+    const matchesStatus =
+      !status ||
+      status === "all" ||
+      request.status === status;
+
+    return (
+      matchesSearch &&
+      matchesSeverity &&
+      matchesStatus
+    );
+  });
+}
+
+/* ---------------- RENDER ---------------- */
+
+function renderEverything() {
   renderRequests();
   renderShelters();
-  renderMissing(document.getElementById('missingSearch').value);
+  renderMissingPersons();
   renderDashboard();
+  renderStats();
+  renderMapMarkers();
 }
-refreshAll();
+
+function renderRequests() {
+  const containers = document.querySelectorAll(
+    "[data-requests-list], #requestsList, #requestList"
+  );
+
+  if (!containers.length) return;
+
+  const requests = getFilteredRequests();
+
+  containers.forEach(container => {
+    if (!requests.length) {
+      container.innerHTML = emptyState(
+        "No requests found",
+        "Try changing your filters or create a new emergency request."
+      );
+      return;
+    }
+
+    container.innerHTML = requests
+      .map(requestCard)
+      .join("");
+  });
+}
+
+function requestCard(request) {
+  const elapsed = formatTimeAgo(request.createdAt);
+
+  return `
+    <article class="request-card ${request.severity}">
+      <div class="request-card-top">
+        <span class="status-badge ${request.severity}">
+          ${capitalize(request.severity)}
+        </span>
+
+        <span class="request-time">
+          ${elapsed}
+        </span>
+      </div>
+
+      <div class="request-icon">
+        ${getRequestIcon(request.type)}
+      </div>
+
+      <h3>${escapeHTML(request.title)}</h3>
+
+      <p>
+        ${escapeHTML(request.description)}
+      </p>
+
+      <div class="request-meta">
+        <span>📍 ${escapeHTML(request.location)}</span>
+        <span>🆘 ${escapeHTML(request.type)}</span>
+      </div>
+
+      <div class="request-status">
+        <span class="status-dot ${request.status}"></span>
+        ${capitalize(request.status)}
+        ${
+          request.claimedBy
+            ? ` · ${escapeHTML(request.claimedBy)}`
+            : ""
+        }
+      </div>
+
+      <div class="request-actions">
+        <button
+          class="btn btn-secondary"
+          onclick="openRequest('${request.id}')"
+        >
+          View
+        </button>
+
+        ${
+          request.status === "open"
+            ? `
+              <button
+                class="btn btn-primary"
+                onclick="claimRequest('${request.id}')"
+              >
+                Claim
+              </button>
+            `
+            : ""
+        }
+
+        ${
+          request.status === "claimed"
+            ? `
+              <button
+                class="btn btn-success"
+                onclick="resolveRequest('${request.id}')"
+              >
+                Resolve
+              </button>
+            `
+            : ""
+        }
+
+        <button
+          class="btn btn-ghost"
+          onclick="focusMap(${request.lat}, ${request.lng})"
+        >
+          Map
+        </button>
+      </div>
+    </article>
+  `;
+}
+
+function renderShelters() {
+  const containers = document.querySelectorAll(
+    "[data-shelters-list], #sheltersList, #shelterList"
+  );
+
+  if (!containers.length) return;
+
+  const search = getValue([
+    "#shelterSearch"
+  ]).toLowerCase();
+
+  const filter = getValue([
+    "#shelterFilter"
+  ]).toLowerCase();
+
+  let shelters = state.shelters.filter(shelter => {
+    const available =
+      shelter.capacity - shelter.occupied;
+
+    const matchesSearch =
+      !search ||
+      shelter.name.toLowerCase().includes(search) ||
+      shelter.address.toLowerCase().includes(search);
+
+    const matchesFilter =
+      !filter ||
+      filter === "all" ||
+      (filter === "available" && available > 0) ||
+      (filter === "full" && available <= 0) ||
+      shelter.status === filter;
+
+    return matchesSearch && matchesFilter;
+  });
+
+  containers.forEach(container => {
+    container.innerHTML = shelters.length
+      ? shelters.map(shelterCard).join("")
+      : emptyState(
+          "No shelters found",
+          "Try another search or availability filter."
+        );
+  });
+}
+
+function shelterCard(shelter) {
+  const available =
+    Math.max(
+      shelter.capacity - shelter.occupied,
+      0
+    );
+
+  const percentage =
+    Math.min(
+      Math.round(
+        (shelter.occupied / shelter.capacity) * 100
+      ),
+      100
+    );
+
+  const availabilityClass =
+    percentage >= 90
+      ? "danger"
+      : percentage >= 70
+      ? "warning"
+      : "good";
+
+  return `
+    <article class="shelter-card">
+      <div class="shelter-card-header">
+        <div>
+          <span class="shelter-label">SHELTER</span>
+          <h3>${escapeHTML(shelter.name)}</h3>
+        </div>
+
+        <span class="status-badge ${availabilityClass}">
+          ${
+            available > 0
+              ? `${available} spaces`
+              : "Full"
+          }
+        </span>
+      </div>
+
+      <p class="shelter-address">
+        📍 ${escapeHTML(shelter.address)}
+      </p>
+
+      <div class="capacity-info">
+        <div>
+          <span>Capacity</span>
+          <strong>
+            ${shelter.occupied}/${shelter.capacity}
+          </strong>
+        </div>
+
+        <span>${percentage}%</span>
+      </div>
+
+      <div class="capacity-bar">
+        <span
+          style="width:${percentage}%"
+        ></span>
+      </div>
+
+      <div class="shelter-actions">
+        <button
+          class="btn btn-primary"
+          onclick="focusShelter(${shelter.id})"
+        >
+          View Map
+        </button>
+
+        <button
+          class="btn btn-secondary"
+          onclick="showShelterDetails(${shelter.id})"
+        >
+          Details
+        </button>
+      </div>
+    </article>
+  `;
+}
+
+function showShelterDetails(id) {
+  const shelter = state.shelters.find(
+    item => item.id === id
+  );
+
+  if (!shelter) return;
+
+  showToast(
+    `${shelter.name}: ${shelter.capacity - shelter.occupied} spaces available`,
+    "info"
+  );
+}
+
+/* ---------------- MISSING PERSONS ---------------- */
+
+function handleMissingPersonSubmit(event) {
+  event.preventDefault();
+
+  const form = event.currentTarget;
+  const data = new FormData(form);
+
+  const imageInput = form.querySelector(
+    'input[type="file"]'
+  );
+
+  const file = imageInput?.files?.[0];
+
+  if (file && file.size > 2 * 1024 * 1024) {
+    showToast(
+      "Image must be smaller than 2 MB.",
+      "error"
+    );
+    return;
+  }
+
+  const createPerson = image => {
+    const person = {
+      id: generateId("MP"),
+      name: data.get("name") || "Unknown",
+      age: Number(data.get("age")) || null,
+      gender: data.get("gender") || "",
+      location: data.get("location") || "",
+      description: data.get("description") || "",
+      image: image || "",
+      status: "missing",
+      createdAt: Date.now()
+    };
+
+    state.missingPersons.unshift(person);
+
+    saveState();
+    renderMissingPersons();
+
+    form.reset();
+
+    closeModal("missingPersonModal");
+
+    showToast(
+      "Missing-person report published.",
+      "success"
+    );
+  };
+
+  if (file) {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      createPerson(reader.result);
+    };
+
+    reader.readAsDataURL(file);
+  } else {
+    createPerson("");
+  }
+}
+
+function renderMissingPersons() {
+  const containers = document.querySelectorAll(
+    "[data-missing-list], #missingList, #missingPersonsList"
+  );
+
+  if (!containers.length) return;
+
+  const search = getValue([
+    "#missingSearch"
+  ]).toLowerCase();
+
+  const status = getValue([
+    "#missingStatusFilter"
+  ]).toLowerCase();
+
+  const people = state.missingPersons.filter(person => {
+    const matchesSearch =
+      !search ||
+      person.name.toLowerCase().includes(search) ||
+      person.location.toLowerCase().includes(search);
+
+    const matchesStatus =
+      !status ||
+      status === "all" ||
+      person.status === status;
+
+    return matchesSearch && matchesStatus;
+  });
+
+  containers.forEach(container => {
+    container.innerHTML = people.length
+      ? people.map(missingPersonCard).join("")
+      : emptyState(
+          "No matching reports",
+          "Try another search."
+        );
+  });
+}
+
+function missingPersonCard(person) {
+  const initials = getInitials(person.name);
+
+  return `
+    <article class="missing-card">
+      <div class="missing-photo">
+        ${
+          person.image
+            ? `<img src="${person.image}" alt="${escapeHTML(person.name)}">`
+            : `<span>${initials}</span>`
+        }
+      </div>
+
+      <div class="missing-info">
+        <div class="missing-card-top">
+          <span class="status-badge ${person.status}">
+            ${capitalize(person.status)}
+          </span>
+
+          <span>
+            ${formatTimeAgo(person.createdAt)}
+          </span>
+        </div>
+
+        <h3>${escapeHTML(person.name)}</h3>
+
+        <p>
+          ${person.age ? `${person.age} years` : ""}
+          ${person.gender ? ` · ${escapeHTML(person.gender)}` : ""}
+        </p>
+
+        <p>
+          📍 ${escapeHTML(person.location)}
+        </p>
+
+        <p>
+          ${escapeHTML(person.description)}
+        </p>
+
+        ${
+          person.status === "missing"
+            ? `
+              <button
+                class="btn btn-success"
+                onclick="markPersonFound('${person.id}')"
+              >
+                Mark Found
+              </button>
+            `
+            : ""
+        }
+      </div>
+    </article>
+  `;
+}
+
+function markPersonFound(id) {
+  const person = state.missingPersons.find(
+    item => item.id === id
+  );
+
+  if (!person) return;
+
+  person.status = "found";
+
+  saveState();
+  renderMissingPersons();
+
+  showToast(
+    `${person.name} marked as found.`,
+    "success"
+  );
+}
+
+/* ---------------- SOS ---------------- */
+
+function setupSOS() {
+  document.querySelectorAll("[data-sos]").forEach(button => {
+    button.addEventListener("click", triggerSOS);
+  });
+}
+
+function triggerSOS() {
+  const confirmed = window.confirm(
+    "Send an emergency SOS with your current location?"
+  );
+
+  if (!confirmed) return;
+
+  const createAlert = (
+    latitude = null,
+    longitude = null
+  ) => {
+    const alert = {
+      id: generateId("SOS"),
+      lat: latitude,
+      lng: longitude,
+      createdAt: Date.now(),
+      status: "active"
+    };
+
+    state.sosAlerts.unshift(alert);
+
+    saveState();
+
+    if (
+      latitude &&
+      longitude &&
+      map
+    ) {
+      focusMap(
+        latitude,
+        longitude,
+        16
+      );
+
+      if (userMarker) {
+        userMarker.remove();
+      }
+
+      userMarker = L.marker([
+        latitude,
+        longitude
+      ])
+        .addTo(map)
+        .bindPopup(
+          "🚨 SOS location"
+        )
+        .openPopup();
+    }
+
+    showToast(
+      "SOS sent. Help has been alerted.",
+      "success"
+    );
+  };
+
+  if (!navigator.geolocation) {
+    createAlert();
+    return;
+  }
+
+  navigator.geolocation.getCurrentPosition(
+    position => {
+      createAlert(
+        position.coords.latitude,
+        position.coords.longitude
+      );
+    },
+    () => {
+      createAlert();
+    },
+    {
+      enableHighAccuracy: true,
+      timeout: 8000
+    }
+  );
+}
+
+/* ---------------- DASHBOARD ---------------- */
+
+function renderDashboard() {
+  const total =
+    state.requests.length;
+
+  const unresolved =
+    state.requests.filter(
+      request =>
+        request.status !== "resolved"
+    ).length;
+
+  const critical =
+    state.requests.filter(
+      request =>
+        request.severity === "critical" &&
+        request.status !== "resolved"
+    ).length;
+
+  const resolved =
+    state.requests.filter(
+      request =>
+        request.status === "resolved"
+    ).length;
+
+  setText(
+    "[data-total-requests]",
+    total
+  );
+
+  setText(
+    "[data-unresolved]",
+    unresolved
+  );
+
+  setText(
+    "[data-critical]",
+    critical
+  );
+
+  setText(
+    "[data-resolved]",
+    resolved
+  );
+
+  renderAreaBreakdown();
+}
+
+function renderAreaBreakdown() {
+  const containers = document.querySelectorAll(
+    "[data-area-breakdown], #areaBreakdown"
+  );
+
+  if (!containers.length) return;
+
+  const areas = {};
+
+  state.requests.forEach(request => {
+    const area = request.location || "Unknown";
+
+    if (!areas[area]) {
+      areas[area] = {
+        total: 0,
+        unresolved: 0,
+        critical: 0
+      };
+    }
+
+    areas[area].total++;
+
+    if (request.status !== "resolved") {
+      areas[area].unresolved++;
+    }
+
+    if (
+      request.severity === "critical" &&
+      request.status !== "resolved"
+    ) {
+      areas[area].critical++;
+    }
+  });
+
+  const sorted = Object.entries(areas)
+    .sort(
+      (a, b) =>
+        b[1].unresolved -
+        a[1].unresolved
+    );
+
+  containers.forEach(container => {
+    container.innerHTML = sorted.length
+      ? sorted
+          .map(
+            ([area, data]) => `
+              <div class="area-row">
+                <div>
+                  <strong>
+                    ${escapeHTML(area)}
+                  </strong>
+                  <small>
+                    ${data.unresolved} unresolved
+                  </small>
+                </div>
+
+                <span class="severity-count">
+                  ${data.critical} critical
+                </span>
+              </div>
+            `
+          )
+          .join("")
+      : emptyState(
+          "No data yet",
+          "Requests will appear here automatically."
+        );
+  });
+}
+
+function renderStats() {
+  const activeRequests =
+    state.requests.filter(
+      request =>
+        request.status !== "resolved"
+    );
+
+  const criticalRequests =
+    activeRequests.filter(
+      request =>
+        request.severity === "critical"
+    );
+
+  const availableBeds =
+    state.shelters.reduce(
+      (total, shelter) =>
+        total +
+        Math.max(
+          shelter.capacity -
+            shelter.occupied,
+          0
+        ),
+      0
+    );
+
+  setText(
+    "[data-active-count]",
+    activeRequests.length
+  );
+
+  setText(
+    "[data-critical-count]",
+    criticalRequests.length
+  );
+
+  setText(
+    "[data-bed-count]",
+    availableBeds
+  );
+
+  setText(
+    "[data-missing-count]",
+    state.missingPersons.filter(
+      person =>
+        person.status === "missing"
+    ).length
+  );
+}
+
+/* ---------------- MODALS ---------------- */
+
+function setupModals() {
+  document.addEventListener("click", event => {
+    const openTarget =
+      event.target.closest(
+        "[data-modal-open]"
+      );
+
+    const closeTarget =
+      event.target.closest(
+        "[data-modal-close]"
+      );
+
+    if (openTarget) {
+      openModal(
+        openTarget.dataset.modalOpen
+      );
+    }
+
+    if (closeTarget) {
+      closeModal(
+        closeTarget.dataset.modalClose
+      );
+    }
+
+    if (
+      event.target.classList.contains(
+        "modal"
+      )
+    ) {
+      event.target.classList.remove(
+        "open"
+      );
+    }
+  });
+
+  document.addEventListener(
+    "keydown",
+    event => {
+      if (event.key === "Escape") {
+        document
+          .querySelectorAll(".modal.open")
+          .forEach(modal => {
+            modal.classList.remove(
+              "open"
+            );
+          });
+      }
+    }
+  );
+}
+
+function openModal(id) {
+  const modal =
+    document.getElementById(id);
+
+  if (!modal) return;
+
+  modal.classList.add("open");
+  document.body.classList.add(
+    "modal-open"
+  );
+
+  const firstInput =
+    modal.querySelector(
+      "input, textarea, select, button"
+    );
+
+  if (firstInput) {
+    setTimeout(
+      () => firstInput.focus(),
+      100
+    );
+  }
+}
+
+function closeModal(id) {
+  const modal =
+    document.getElementById(id);
+
+  if (!modal) return;
+
+  modal.classList.remove(
+    "open"
+  );
+
+  if (
+    !document.querySelector(
+      ".modal.open"
+    )
+  ) {
+    document.body.classList.remove(
+      "modal-open"
+    );
+  }
+}
+
+/* ---------------- MOBILE MENU ---------------- */
+
+function setupMobileMenu() {
+  const toggle =
+    document.querySelector(
+      "[data-menu-toggle]"
+    );
+
+  const menu =
+    document.querySelector(
+      "[data-mobile-menu]"
+    );
+
+  if (!toggle || !menu) return;
+
+  toggle.addEventListener(
+    "click",
+    () => {
+      menu.classList.toggle(
+        "open"
+      );
+
+      toggle.setAttribute(
+        "aria-expanded",
+        menu.classList.contains(
+          "open"
+        )
+      );
+    }
+  );
+}
+
+function closeMobileMenu() {
+  const menu =
+    document.querySelector(
+      "[data-mobile-menu]"
+    );
+
+  if (menu) {
+    menu.classList.remove(
+      "open"
+    );
+  }
+}
+
+/* ---------------- CONNECTION ---------------- */
+
+function updateConnectionStatus() {
+  const online =
+    navigator.onLine;
+
+  document
+    .querySelectorAll(
+      "[data-connection-status]"
+    )
+    .forEach(element => {
+      element.textContent = online
+        ? "Online"
+        : "Offline";
+
+      element.classList.toggle(
+        "offline",
+        !online
+      );
+    });
+
+  if (!online) {
+    showToast(
+      "You are offline. New data will remain on this device until connection returns.",
+      "warning"
+    );
+  }
+}
+
+/* ---------------- HELPERS ---------------- */
+
+function generateId(prefix) {
+  return `${prefix}-${Date.now()
+    .toString(36)
+    .toUpperCase()}-${Math.random()
+    .toString(36)
+    .slice(2, 7)
+    .toUpperCase()}`;
+}
+
+function capitalize(value = "") {
+  return value.charAt(0).toUpperCase() +
+    value.slice(1);
+}
+
+function escapeHTML(value = "") {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function getInitials(name = "") {
+  return name
+    .split(" ")
+    .filter(Boolean)
+    .slice(0, 2)
+    .map(word => word[0])
+    .join("")
+    .toUpperCase();
+}
+
+function getRequestIcon(type) {
+  const icons = {
+    Food: "🍱",
+    Water: "💧",
+    Medical: "🏥",
+    Rescue: "🚨",
+    Shelter: "🏠",
+    Other: "⚠️"
+  };
+
+  return icons[type] || icons.Other;
+}
+
+function formatTimeAgo(timestamp) {
+  const seconds =
+    Math.floor(
+      (Date.now() - timestamp) /
+        1000
+    );
+
+  if (seconds < 60) {
+    return "Just now";
+  }
+
+  const minutes =
+    Math.floor(seconds / 60);
+
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+
+  const hours =
+    Math.floor(minutes / 60);
+
+  if (hours < 24) {
+    return `${hours}h ago`;
+  }
+
+  const days =
+    Math.floor(hours / 24);
+
+  return `${days}d ago`;
+}
+
+function getValue(selectors) {
+  for (const selector of selectors) {
+    const element =
+      document.querySelector(selector);
+
+    if (element) {
+      return element.value || "";
+    }
+  }
+
+  return "";
+}
+
+function setText(selector, value) {
+  document
+    .querySelectorAll(selector)
+    .forEach(element => {
+      element.textContent = value;
+    });
+}
+
+function emptyState(title, description) {
+  return `
+    <div class="empty-state">
+      <div class="empty-icon">📭</div>
+      <h3>${escapeHTML(title)}</h3>
+      <p>${escapeHTML(description)}</p>
+    </div>
+  `;
+}
+
+/* ---------------- TOAST ---------------- */
+
+function showToast(
+  message,
+  type = "info"
+) {
+  let container =
+    document.querySelector(
+      "#toastContainer"
+    );
+
+  if (!container) {
+    container =
+      document.createElement("div");
+
+    container.id =
+      "toastContainer";
+
+    container.className =
+      "toast-container";
+
+    document.body.appendChild(
+      container
+    );
+  }
+
+  const toast =
+    document.createElement("div");
+
+  toast.className =
+    `toast toast-${type}`;
+
+  toast.innerHTML = `
+    <span class="toast-icon">
+      ${getToastIcon(type)}
+    </span>
+
+    <span class="toast-message">
+      ${escapeHTML(message)}
+    </span>
+
+    <button
+      class="toast-close"
+      aria-label="Close notification"
+    >
+      ×
+    </button>
+  `;
+
+  container.appendChild(toast);
+
+  const closeButton =
+    toast.querySelector(
+      ".toast-close"
+    );
+
+  closeButton.addEventListener(
+    "click",
+    () => toast.remove()
+  );
+
+  setTimeout(() => {
+    toast.classList.add(
+      "hide"
+    );
+
+    setTimeout(
+      () => toast.remove(),
+      300
+    );
+  }, 4500);
+}
+
+function getToastIcon(type) {
+  const icons = {
+    success: "✓",
+    error: "!",
+    warning: "⚠",
+    info: "i"
+  };
+
+  return icons[type] || "i";
+}
+
+/* ---------------- CROSS TAB SYNC ---------------- */
+
+if ("BroadcastChannel" in window) {
+  try {
+    const channel =
+      new BroadcastChannel(
+        "sethu_sync"
+      );
+
+    channel.addEventListener(
+      "message",
+      event => {
+        if (!event.data) return;
+
+        state = {
+          ...state,
+          ...event.data
+        };
+
+        renderEverything();
+      }
+    );
+  } catch (error) {
+    console.warn(
+      "Cross-tab sync unavailable."
+    );
+  }
+}
+
+window.addEventListener(
+  "storage",
+  event => {
+    if (
+      event.key !== STORAGE_KEY ||
+      !event.newValue
+    ) {
+      return;
+    }
+
+    try {
+      state = JSON.parse(
+        event.newValue
+      );
+
+      renderEverything();
+    } catch (error) {
+      console.warn(
+        "Storage synchronization failed."
+      );
+    }
+  }
+);
+
+/* ---------------- GLOBAL API ---------------- */
+
+window.openRequest =
+  openRequest;
+
+window.claimRequest =
+  claimRequest;
+
+window.resolveRequest =
+  resolveRequest;
+
+window.focusMap =
+  focusMap;
+
+window.focusShelter =
+  focusShelter;
+
+window.showShelterDetails =
+  showShelterDetails;
+
+window.markPersonFound =
+  markPersonFound;
+
+window.openModal =
+  openModal;
+
+window.closeModal =
+  closeModal;
+
+window.getUserLocation =
+  getUserLocation;
+
+window.triggerSOS =
+  triggerSOS;
