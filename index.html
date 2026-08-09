@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sethu — Disaster Relief Coordination</title>
+<meta name="description" content="Real-time flood and disaster relief coordination for Bihar — report needs, claim requests, find shelters and missing persons.">
+
+<!-- Leaflet map library -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- Fonts: Archivo for display, Inter for body, JetBrains Mono for data -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- connectivity + sync status strip -->
+<div id="statusStrip" class="status-strip" role="status" aria-live="polite">
+  <span id="statusDot" class="status-dot"></span>
+  <span id="statusText">Online — synced</span>
+</div>
+
+<header class="app-header">
+  <div class="brand">
+    <span class="brand-mark">से</span>
+    <div class="brand-text">
+      <h1>Sethu</h1>
+      <p>Bridging relief to where it's needed — Bihar Flood Response</p>
+    </div>
+  </div>
+
+  <nav class="tabs" aria-label="Main sections">
+    <button class="tab-btn active" data-view="map">Live Map</button>
+    <button class="tab-btn" data-view="report">Report Need</button>
+    <button class="tab-btn" data-view="shelters">Shelters</button>
+    <button class="tab-btn" data-view="missing">Missing Persons</button>
+    <button class="tab-btn" data-view="dashboard">Dashboard</button>
+  </nav>
+</header>
+
+<main>
+
+  <!-- LIVE NEED MAP -->
+  <section id="view-map" class="view active" aria-labelledby="map-heading">
+    <div class="map-layout">
+      <div class="map-panel">
+        <h2 id="map-heading" class="visually-hidden">Live need map</h2>
+        <div id="map"></div>
+        <ul class="legend" aria-label="Severity legend">
+          <li><span class="dot dot-critical"></span> Critical</li>
+          <li><span class="dot dot-high"></span> High</li>
+          <li><span class="dot dot-medium"></span> Medium</li>
+          <li><span class="dot dot-resolved"></span> Resolved</li>
+        </ul>
+      </div>
+
+      <aside class="request-list" aria-label="Active requests">
+        <div class="request-list-head">
+          <h2>Requests</h2>
+          <select id="filterSeverity" aria-label="Filter by severity">
+            <option value="all">All severities</option>
+            <option value="critical">Critical</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+          </select>
+        </div>
+        <ul id="requestItems" class="request-items"></ul>
+      </aside>
+    </div>
+  </section>
+
+  <!-- REPORT NEED (victim flow, no login) -->
+  <section id="view-report" class="view" aria-labelledby="report-heading">
+    <div class="form-card">
+      <h2 id="report-heading">Report a need</h2>
+      <p class="form-hint">No account needed. Your location is captured automatically so help can find you.</p>
+
+      <form id="reportForm">
+        <label for="needType">What do you need?</label>
+        <select id="needType" required>
+          <option value="food">Food</option>
+          <option value="water">Drinking water</option>
+          <option value="medical">Medical help</option>
+          <option value="shelter">Shelter</option>
+          <option value="rescue">Rescue</option>
+        </select>
+
+        <label for="severity">How urgent is it?</label>
+        <select id="severity" required>
+          <option value="medium">Medium — can wait a few hours</option>
+          <option value="high">High — needed today</option>
+          <option value="critical">Critical — immediate danger</option>
+        </select>
+
+        <label for="area">Area / village / landmark</label>
+        <input type="text" id="area" placeholder="e.g. Diara village, near Ganga bridge" required>
+
+        <label for="description">Details (optional)</label>
+        <textarea id="description" rows="3" placeholder="Number of people, any specific medicine, etc."></textarea>
+
+        <label for="phone">Phone number (optional)</label>
+        <input type="tel" id="phone" placeholder="So a volunteer can call you">
+
+        <p class="location-status" id="locationStatus">Locating you…</p>
+
+        <button type="submit" class="btn-primary">Submit request</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- SHELTER DIRECTORY -->
+  <section id="view-shelters" class="view" aria-labelledby="shelters-heading">
+    <div class="section-head">
+      <h2 id="shelters-heading">Shelters &amp; resource points</h2>
+      <button id="addShelterBtn" class="btn-secondary">+ Add shelter</button>
+    </div>
+    <div id="shelterGrid" class="card-grid"></div>
+  </section>
+
+  <!-- MISSING PERSONS BOARD -->
+  <section id="view-missing" class="view" aria-labelledby="missing-heading">
+    <div class="section-head">
+      <h2 id="missing-heading">Missing persons</h2>
+      <button id="addMissingBtn" class="btn-secondary">+ Post a report</button>
+    </div>
+    <input type="search" id="missingSearch" class="search-input" placeholder="Search by name or last seen location">
+    <div id="missingGrid" class="card-grid"></div>
+  </section>
+
+  <!-- ADMIN / NGO DASHBOARD -->
+  <section id="view-dashboard" class="view" aria-labelledby="dashboard-heading">
+    <h2 id="dashboard-heading">Coordination dashboard</h2>
+
+    <div class="stat-row" id="statRow"></div>
+
+    <div class="dashboard-grid">
+      <div class="panel">
+        <h3>Unresolved requests by area</h3>
+        <ul id="areaBars" class="bar-list"></ul>
+      </div>
+      <div class="panel">
+        <h3>Requests by severity</h3>
+        <ul id="severityBars" class="bar-list"></ul>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- SOS: always reachable, no login, one tap -->
+<button id="sosBtn" class="sos-btn" aria-label="Send emergency SOS with my location">
+  <span class="sos-ring"></span>
+  <span class="sos-label">SOS</span>
+</button>
+
+<!-- generic modal for add-shelter / add-missing / claim details -->
+<div id="modalOverlay" class="modal-overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <button class="modal-close" id="modalClose" aria-label="Close">×</button>
+    <div id="modalBody"></div>
+  </div>
+</div>
+
+<!-- toast notifications -->
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
